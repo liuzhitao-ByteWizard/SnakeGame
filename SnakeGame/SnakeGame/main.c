@@ -27,6 +27,7 @@
 #define BOARD_HEIGHT (GRID_ROWS * CELL_SIZE)
 #define WINDOW_WIDTH (WINDOW_PADDING * 2 + BOARD_WIDTH + PANEL_GAP + INFO_PANEL_WIDTH)
 #define WINDOW_HEIGHT (WINDOW_PADDING * 2 + BOARD_HEIGHT)
+#define MOVE_INTERVAL_SECONDS 0.18f
 
 #define BOARD_X WINDOW_PADDING
 #define BOARD_Y WINDOW_PADDING
@@ -77,6 +78,7 @@ typedef struct SnakeRenderData
 */
 static Rectangle GridCellToRectangle(int gridX, int gridY)
 {
+    /* 左上角像素 = 棋盘起点 + 网格下标 * 单元格像素大小。 */
     Rectangle cell = {
         (float)(BOARD_X + gridX * CELL_SIZE),
         (float)(BOARD_Y + gridY * CELL_SIZE),
@@ -84,6 +86,7 @@ static Rectangle GridCellToRectangle(int gridX, int gridY)
         (float)CELL_SIZE
     };
 
+    /* 返回的是绘制用矩形，核心层仍然只知道 gridX 和 gridY。 */
     return cell;
 }
 
@@ -107,29 +110,61 @@ static bool BuildSnakeRenderData(const SnakeGameCore* game, SnakeRenderData* ren
         return false;
     }
 
+    /* 先读取蛇长，用它决定本帧需要从核心层拷贝多少节蛇身。 */
     const int snakeLength = SnakeGameGetSnakeLength(game);
+
+    /* 渲染缓冲区最大只能容纳整张地图的格子数，超出说明核心状态异常。 */
     if (snakeLength < 0 || snakeLength > SNAKE_RENDER_MAX_SEGMENTS)
     {
         return false;
     }
 
+    /* 每帧重新生成渲染快照，所以先清空数量，再记录当前蛇头朝向。 */
     renderData->segmentCount = 0;
     renderData->direction = SnakeGameGetDirection(game);
 
+    /* 按链表顺序逐节读取蛇身：i 为 0 是蛇头，后面依次靠近蛇尾。 */
     for (int i = 0; i < snakeLength; ++i)
     {
         SnakeGridPosition position;
+
+        /* 通过核心层查询接口取坐标，界面层不直接碰 snakeBody 链表指针。 */
         if (!SnakeGameGetSnakeSegment(game, i, &position))
         {
             return false;
         }
 
+        /* 保存这一节的网格坐标，并标记第 0 节为蛇头，方便后面选择绘制方式。 */
         renderData->segments[i].position = position;
         renderData->segments[i].isHead = (i == 0);
         renderData->segmentCount++;
     }
 
     return true;
+}
+
+static void HandleDirectionInput(SnakeGameCore* game)
+{
+    /* 界面层只负责把“上方向键或 W”翻译为“向上”，是否合法交给核心层判断。 */
+    if (IsKeyPressed(KEY_UP) || IsKeyPressed(KEY_W))
+    {
+        SnakeGameRequestDirection(game, SNAKE_DIRECTION_UP);
+    }
+    /* 界面层只负责把“右方向键或 D”翻译为“向右”，不在这里处理禁止反向规则。 */
+    else if (IsKeyPressed(KEY_RIGHT) || IsKeyPressed(KEY_D))
+    {
+        SnakeGameRequestDirection(game, SNAKE_DIRECTION_RIGHT);
+    }
+    /* 界面层只负责把“下方向键或 S”翻译为“向下”，核心层会统一处理游戏规则。 */
+    else if (IsKeyPressed(KEY_DOWN) || IsKeyPressed(KEY_S))
+    {
+        SnakeGameRequestDirection(game, SNAKE_DIRECTION_DOWN);
+    }
+    /* 界面层只负责把“左方向键或 A”翻译为“向左”，这样键盘和未来输入方式规则一致。 */
+    else if (IsKeyPressed(KEY_LEFT) || IsKeyPressed(KEY_A))
+    {
+        SnakeGameRequestDirection(game, SNAKE_DIRECTION_LEFT);
+    }
 }
 
 static void DrawBoardBackground(void)
@@ -139,6 +174,7 @@ static void DrawBoardBackground(void)
         后续游戏核心也会使用同样的 30 x 20 地图尺寸；Phase 1 先把棋盘画出来，
         可以直观看到界面是否已经符合规格。
     */
+    /* 先画棋盘外框，让游戏区域和右侧信息栏在视觉上分开。 */
     DrawRectangle(
         BOARD_X - BOARD_BORDER,
         BOARD_Y - BOARD_BORDER,
@@ -146,14 +182,17 @@ static void DrawBoardBackground(void)
         BOARD_HEIGHT + BOARD_BORDER * 2,
         kBoardBorderColor);
 
+    /* 再逐行逐列画 30 x 20 个格子，和核心层地图尺寸保持一致。 */
     for (int y = 0; y < GRID_ROWS; ++y)
     {
         for (int x = 0; x < GRID_COLUMNS; ++x)
         {
+            /* 用 x + y 的奇偶性做棋盘格交替颜色，帮助玩家分辨每个格子。 */
             const bool useGreenCell = ((x + y) % 2) == 0;
             const Color cellColor = useGreenCell ? kGridGreen : kGridDark;
-            const Rectangle cell = GridCellToRectangle(x, y);
 
+            /* 把当前网格坐标转成屏幕矩形后，再交给 raylib 绘制。 */
+            const Rectangle cell = GridCellToRectangle(x, y);
             DrawRectangleRec(cell, cellColor);
         }
     }
@@ -177,6 +216,7 @@ static void DrawBoardBackground(void)
 
 static Color BlendSnakeSegmentColor(float amount)
 {
+    /* 在浅绿色和深绿色之间做线性插值，让相邻身体节段有轻微层次。 */
     Color color = {
         (unsigned char)(kSnakeBodyColor.r + (kSnakeBodyDarkColor.r - kSnakeBodyColor.r) * amount),
         (unsigned char)(kSnakeBodyColor.g + (kSnakeBodyDarkColor.g - kSnakeBodyColor.g) * amount),
@@ -201,21 +241,28 @@ static Color BlendSnakeSegmentColor(float amount)
 */
 static void DrawSnakeBodySegment(SnakeGridPosition position, int segmentIndex)
 {
+    /* 先把这一节蛇身的网格坐标转换成屏幕矩形。 */
     Rectangle segmentRect = GridCellToRectangle(position.x, position.y);
+
+    /* 缩小一点矩形，给格子边缘留出空隙，让每节身体更容易分辨。 */
     segmentRect.x += 3.0f;
     segmentRect.y += 3.0f;
     segmentRect.width -= 6.0f;
     segmentRect.height -= 6.0f;
 
+    /* 按节段下标循环取深浅变化，避免整条蛇看起来只有一块纯色。 */
     const float fadeStep = (float)(segmentIndex % 4) * 0.08f;
     const Color segmentColor = BlendSnakeSegmentColor(fadeStep);
 
+    /* 画圆角主体，对应链表中的一个身体节点。 */
     DrawRectangleRounded(segmentRect, 0.26f, 8, segmentColor);
 
+    /* 在身体左上方加一条淡高光，提高立体感，但不影响核心逻辑。 */
     Vector2 highlightStart = { segmentRect.x + 6.0f, segmentRect.y + 6.0f };
     Vector2 highlightEnd = { segmentRect.x + segmentRect.width * 0.56f, segmentRect.y + 6.0f };
     DrawLineEx(highlightStart, highlightEnd, 2.0f, Fade(kSnakeBodyHighlightColor, 0.28f));
 
+    /* 最后画一圈很淡的描边，让绿色蛇身从深色棋盘上更清楚地分离出来。 */
     DrawRectangleRoundedLines(segmentRect, 0.26f, 8, Fade(kTitleColor, 0.16f));
 }
 
@@ -232,15 +279,18 @@ static void DrawSnakeBodySegment(SnakeGridPosition position, int segmentIndex)
 */
 static void DrawSnakeHead(SnakeGridPosition position, SnakeDirection direction)
 {
+    /* 蛇头也从网格坐标转换为屏幕矩形，但比身体稍大一点以突出头部。 */
     Rectangle headRect = GridCellToRectangle(position.x, position.y);
     headRect.x += 2.0f;
     headRect.y += 2.0f;
     headRect.width -= 4.0f;
     headRect.height -= 4.0f;
 
+    /* 先画蛇头的底色和描边，五官会覆盖在这个圆角矩形上。 */
     DrawRectangleRounded(headRect, 0.30f, 10, kSnakeHeadColor);
     DrawRectangleRoundedLines(headRect, 0.30f, 10, Fade(kTitleColor, 0.24f));
 
+    /* 默认先按“向右”摆放五官；如果方向不是向右，下面的 switch 会覆盖这些位置。 */
     Vector2 firstEye = { headRect.x + headRect.width * 0.66f, headRect.y + headRect.height * 0.32f };
     Vector2 secondEye = { headRect.x + headRect.width * 0.66f, headRect.y + headRect.height * 0.68f };
     Vector2 firstNostril = { headRect.x + headRect.width * 0.82f, headRect.y + headRect.height * 0.43f };
@@ -248,6 +298,7 @@ static void DrawSnakeHead(SnakeGridPosition position, SnakeDirection direction)
     Vector2 mouthStart = { headRect.x + headRect.width * 0.69f, headRect.y + headRect.height * 0.50f };
     Vector2 mouthEnd = { headRect.x + headRect.width * 0.78f, headRect.y + headRect.height * 0.50f };
 
+    /* 根据蛇头方向重新摆放五官，确保玩家能从画面上看出当前移动方向。 */
     switch (direction)
     {
     case SNAKE_DIRECTION_UP:
@@ -279,6 +330,7 @@ static void DrawSnakeHead(SnakeGridPosition position, SnakeDirection direction)
         break;
     }
 
+    /* 最后按计算好的位置画眼睛、鼻孔和嘴巴，完成蛇头朝向提示。 */
     DrawCircleV(firstEye, 2.6f, kSnakeEyeColor);
     DrawCircleV(secondEye, 2.6f, kSnakeEyeColor);
     DrawCircleV(firstNostril, 1.25f, kSnakeNostrilColor);
@@ -293,9 +345,12 @@ static void DrawSnake(const SnakeRenderData* renderData)
         return;
     }
 
+    /* 从蛇尾画到蛇头，保证蛇头最后绘制，视觉上不会被身体盖住。 */
     for (int i = renderData->segmentCount - 1; i >= 0; --i)
     {
         const SnakeSegmentRenderData* segment = &renderData->segments[i];
+
+        /* 第 0 节在构建快照时被标记为蛇头，因此这里使用专门的蛇头绘制函数。 */
         if (segment->isHead)
         {
             DrawSnakeHead(segment->position, renderData->direction);
@@ -378,23 +433,48 @@ int main(void)
         main.c 再把这些数据画到屏幕上。这样的拆分可以保证游戏核心不依赖 raylib，
         之后才能用 gtest 单独测试。
     */
+    /* 开启垂直同步，减少窗口刷新时的画面撕裂。 */
     SetConfigFlags(FLAG_VSYNC_HINT);
-    InitWindow(WINDOW_WIDTH, WINDOW_HEIGHT, "SnakeGame - Phase 3 Snake Render");
+
+    /* 创建固定尺寸窗口；窗口尺寸来自棋盘、边距和右侧信息栏的组合。 */
+    InitWindow(WINDOW_WIDTH, WINDOW_HEIGHT, "SnakeGame - Phase 4 Movement");
+
+    /* 界面每秒绘制 60 次，蛇的实际移动速度由 MOVE_INTERVAL_SECONDS 控制。 */
     SetTargetFPS(60);
 
     SnakeGameCore game;
+
+    /* 初始化游戏核心；如果蛇身链表创建失败，直接关闭窗口并返回错误码。 */
     if (!SnakeGameInit(&game))
     {
         CloseWindow();
         return 1;
     }
 
+    /* 计时器用于把 60 FPS 的绘制循环转换成 180ms 一格的蛇移动节奏。 */
+    float moveTimer = 0.0f;
+
     while (!WindowShouldClose())
     {
+        /* 每帧先读取输入，让玩家刚按下的方向尽快进入核心层。 */
+        HandleDirectionInput(&game);
+
+        /* 累加本帧耗时；只有累计超过移动间隔时，蛇才真正前进一步。 */
+        moveTimer += GetFrameTime();
+        if (moveTimer >= MOVE_INTERVAL_SECONDS)
+        {
+            /* 单步推进由核心层完成，界面层不直接修改蛇身链表。 */
+            SnakeGameStep(&game);
+            moveTimer = 0.0f;
+        }
+
+        /* BeginDrawing 和 EndDrawing 之间只做本帧绘制，不改变核心规则。 */
         BeginDrawing();
         ClearBackground(kWindowBackground);
 
         DrawBoardBackground();
+
+        /* 从核心层构建只读渲染快照，构建成功后再绘制蛇。 */
         SnakeRenderData snakeRenderData;
         if (BuildSnakeRenderData(&game, &snakeRenderData))
         {
@@ -405,6 +485,7 @@ int main(void)
         EndDrawing();
     }
 
+    /* 退出窗口前释放核心层持有的蛇身链表资源。 */
     SnakeGameDestroy(&game);
     CloseWindow();
     return 0;

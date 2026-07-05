@@ -33,9 +33,9 @@ extern "C" {
 typedef enum SnakeDirection
 {
     SNAKE_DIRECTION_UP = 0,
-    SNAKE_DIRECTION_RIGHT,
-    SNAKE_DIRECTION_DOWN,
-    SNAKE_DIRECTION_LEFT
+    SNAKE_DIRECTION_RIGHT, //1
+    SNAKE_DIRECTION_DOWN, //2
+    SNAKE_DIRECTION_LEFT //3
 } SnakeDirection;
 
 /*
@@ -109,6 +109,8 @@ int SnakeGameGetMapRows(const SnakeGameCore* game);
 int SnakeGameGetSnakeLength(const SnakeGameCore* game);
 SnakeDirection SnakeGameGetDirection(const SnakeGameCore* game);
 SnakeGameStatus SnakeGameGetStatus(const SnakeGameCore* game);
+/* 请求改变移动方向；具体的禁止反向规则由 game_core.c 在执行语句前说明。 */
+bool SnakeGameRequestDirection(SnakeGameCore* game, SnakeDirection requestedDirection);
 
 /*
     读取蛇头坐标。
@@ -120,7 +122,6 @@ bool SnakeGameGetSnakeHead(const SnakeGameCore* game, SnakeGridPosition* outPosi
 
 /*
     读取蛇尾坐标。
-
     蛇尾就是链表中的最后一个真实节点，也就是 snakeBody->prev。
     普通移动时被删除的正是这个节点。
 */
@@ -128,7 +129,6 @@ bool SnakeGameGetSnakeTail(const SnakeGameCore* game, SnakeGridPosition* outPosi
 
 /*
     按下标读取蛇身任意一节的位置。
-
     index 从 0 开始：0 表示蛇头，snakeLength - 1 表示蛇尾。这个接口让测试和
     后续渲染层可以按“从头到尾”的顺序遍历蛇身，而不需要直接操作链表指针。
 */

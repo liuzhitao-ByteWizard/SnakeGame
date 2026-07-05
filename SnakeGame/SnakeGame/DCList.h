@@ -3,6 +3,10 @@
 
 #include "grid_position.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /*
     双向循环链表是蛇身的实际存储结构。
 
@@ -39,5 +43,9 @@ void DCListPopBack(DCListNode* L);
 
 int DCListSize(const DCListNode* L);
 void DCListPrint(const DCListNode* L);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif
