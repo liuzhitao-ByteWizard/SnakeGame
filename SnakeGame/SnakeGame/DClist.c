@@ -9,9 +9,11 @@
 static DCListNode* BuyDCListNode(DCLDataType data)
 {
     /*
-        链表节点必须从堆上申请内存，因为蛇身节点要在本函数返回后继续存在。
-        如果这里使用局部变量，函数结束后局部变量会失效，链表中保存的指针
-        就会变成悬空指针。
+        链表节点必须从堆上申请。
+
+        蛇身节点会在函数返回后继续留在链表里，如果使用局部变量，
+        函数结束后节点地址就失效了，蛇身链表会变成悬空指针。
+        所以每一节蛇身都通过 malloc 创建，并在删除节点或销毁链表时释放。
     */
     DCListNode* newNode = (DCListNode*)malloc(sizeof(DCListNode));
     if (newNode == NULL)
@@ -29,15 +31,11 @@ static DCListNode* BuyDCListNode(DCLDataType data)
 DCListNode* DCListInit(void)
 {
     /*
-        本链表使用“哨兵头节点”。哨兵节点不表示蛇身的一节，它只是一个
-        固定锚点，让空链表、头插、尾删都能使用统一的指针规则。
+        本链表使用哨兵节点。哨兵节点不代表蛇身的一节，
+        它只是一个固定锚点，让空链表、头插、尾删都能走统一逻辑。
 
-        在空的循环链表中，哨兵节点的前后指针都指向自己：
-
-            L->next == L
-            L->prev == L
-
-        插入真实蛇身节点后，L->next 就是蛇头，L->prev 就是蛇尾。
+        空链表时：L->next == L，并且 L->prev == L。
+        插入蛇身后：L->next 是蛇头，L->prev 是蛇尾。
     */
     const SnakeGridPosition sentinelValue = { -1, -1 };
     DCListNode* L = BuyDCListNode(sentinelValue);
@@ -107,8 +105,8 @@ void DCListInsert(DCListNode* pos, DCLDataType x)
     /*
         在 pos 节点后插入新节点。
 
-        对蛇的移动来说，在哨兵节点 L 后插入就是“头插”：新节点会成为
-        L->next，也就是游戏核心读取到的蛇头。
+        对贪吃蛇来说，如果 pos 是哨兵节点 L，那么这里就是头插：
+        新节点会成为 L->next，也就是游戏核心读取到的新蛇头。
     */
     DCListNode* newNode = BuyDCListNode(x);
 
