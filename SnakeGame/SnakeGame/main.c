@@ -52,6 +52,10 @@ static const Color kSnakeEyeColor = { 8, 18, 14, 255 };
 static const Color kSnakeNostrilColor = { 7, 24, 15, 255 };
 static const Color kSnakeMouthColor = { 6, 35, 18, 255 };
 static const Color kSnakeBodyHighlightColor = { 136, 244, 154, 255 };
+static const Color kSnakeRedHeadColor = { 246, 92, 91, 255 };
+static const Color kSnakeRedBodyColor = { 210, 54, 64, 255 };
+static const Color kSnakeRedBodyDarkColor = { 139, 34, 46, 255 };
+static const Color kSnakeRedBodyHighlightColor = { 255, 150, 140, 255 };
 
 #define SNAKE_RENDER_MAX_SEGMENTS (GRID_COLUMNS * GRID_ROWS)
 
@@ -66,6 +70,7 @@ typedef struct SnakeRenderData
     SnakeSegmentRenderData segments[SNAKE_RENDER_MAX_SEGMENTS];
     int segmentCount;
     SnakeDirection direction;
+    SnakeColorMode colorMode;
 } SnakeRenderData;
 
 /*
@@ -122,6 +127,7 @@ static bool BuildSnakeRenderData(const SnakeGameCore* game, SnakeRenderData* ren
     /* 每帧重新生成渲染快照，所以先清空数量，再记录当前蛇头朝向。 */
     renderData->segmentCount = 0;
     renderData->direction = SnakeGameGetDirection(game);
+    renderData->colorMode = SnakeGameGetSnakeColorMode(game);
 
     /* 按链表顺序逐节读取蛇身：i 为 0 是蛇头，后面依次靠近蛇尾。 */
     for (int i = 0; i < snakeLength; ++i)
@@ -214,13 +220,19 @@ static void DrawBoardBackground(void)
     }
 }
 
-static Color BlendSnakeSegmentColor(float amount)
+static Color BlendSnakeSegmentColor(float amount, SnakeColorMode colorMode)
 {
-    /* 在浅绿色和深绿色之间做线性插值，让相邻身体节段有轻微层次。 */
+    /*
+        身体颜色仍然保留“深浅渐变”的表现，只是根据核心层的颜色模式换一套调色板。
+        绿色是开局默认颜色；吃到红苹果后，核心会把颜色模式设为 RED，界面层就用红色身体。
+    */
+    const Color baseColor = (colorMode == SNAKE_COLOR_MODE_RED) ? kSnakeRedBodyColor : kSnakeBodyColor;
+    const Color darkColor = (colorMode == SNAKE_COLOR_MODE_RED) ? kSnakeRedBodyDarkColor : kSnakeBodyDarkColor;
+
     Color color = {
-        (unsigned char)(kSnakeBodyColor.r + (kSnakeBodyDarkColor.r - kSnakeBodyColor.r) * amount),
-        (unsigned char)(kSnakeBodyColor.g + (kSnakeBodyDarkColor.g - kSnakeBodyColor.g) * amount),
-        (unsigned char)(kSnakeBodyColor.b + (kSnakeBodyDarkColor.b - kSnakeBodyColor.b) * amount),
+        (unsigned char)(baseColor.r + (darkColor.r - baseColor.r) * amount),
+        (unsigned char)(baseColor.g + (darkColor.g - baseColor.g) * amount),
+        (unsigned char)(baseColor.b + (darkColor.b - baseColor.b) * amount),
         255
     };
 
@@ -239,7 +251,7 @@ static Color BlendSnakeSegmentColor(float amount)
     的视觉处理：在不改变“圆角方块蛇”的前提下，让蛇身看起来更清爽、有一点
     立体感，同时仍然保持每一节都清楚地落在自己的格子里。
 */
-static void DrawSnakeBodySegment(SnakeGridPosition position, int segmentIndex)
+static void DrawSnakeBodySegment(SnakeGridPosition position, int segmentIndex, SnakeColorMode colorMode)
 {
     /* 先把这一节蛇身的网格坐标转换成屏幕矩形。 */
     Rectangle segmentRect = GridCellToRectangle(position.x, position.y);
@@ -252,7 +264,7 @@ static void DrawSnakeBodySegment(SnakeGridPosition position, int segmentIndex)
 
     /* 按节段下标循环取深浅变化，避免整条蛇看起来只有一块纯色。 */
     const float fadeStep = (float)(segmentIndex % 4) * 0.08f;
-    const Color segmentColor = BlendSnakeSegmentColor(fadeStep);
+    const Color segmentColor = BlendSnakeSegmentColor(fadeStep, colorMode);
 
     /* 画圆角主体，对应链表中的一个身体节点。 */
     DrawRectangleRounded(segmentRect, 0.26f, 8, segmentColor);
@@ -260,7 +272,8 @@ static void DrawSnakeBodySegment(SnakeGridPosition position, int segmentIndex)
     /* 在身体左上方加一条淡高光，提高立体感，但不影响核心逻辑。 */
     Vector2 highlightStart = { segmentRect.x + 6.0f, segmentRect.y + 6.0f };
     Vector2 highlightEnd = { segmentRect.x + segmentRect.width * 0.56f, segmentRect.y + 6.0f };
-    DrawLineEx(highlightStart, highlightEnd, 2.0f, Fade(kSnakeBodyHighlightColor, 0.28f));
+    const Color highlightColor = (colorMode == SNAKE_COLOR_MODE_RED) ? kSnakeRedBodyHighlightColor : kSnakeBodyHighlightColor;
+    DrawLineEx(highlightStart, highlightEnd, 2.0f, Fade(highlightColor, 0.28f));
 
     /* 最后画一圈很淡的描边，让绿色蛇身从深色棋盘上更清楚地分离出来。 */
     DrawRectangleRoundedLines(segmentRect, 0.26f, 8, Fade(kTitleColor, 0.16f));
@@ -277,7 +290,7 @@ static void DrawSnakeBodySegment(SnakeGridPosition position, int segmentIndex)
     这些五官都控制在一个 28px 格子内部。眼睛放在靠后的两侧，鼻孔放在前端，
     嘴巴画成短线并稍微离开边缘，这样能看出朝向，又不会让蛇头显得拥挤。
 */
-static void DrawSnakeHead(SnakeGridPosition position, SnakeDirection direction)
+static void DrawSnakeHead(SnakeGridPosition position, SnakeDirection direction, SnakeColorMode colorMode)
 {
     /* 蛇头也从网格坐标转换为屏幕矩形，但比身体稍大一点以突出头部。 */
     Rectangle headRect = GridCellToRectangle(position.x, position.y);
@@ -353,11 +366,11 @@ static void DrawSnake(const SnakeRenderData* renderData)
         /* 第 0 节在构建快照时被标记为蛇头，因此这里使用专门的蛇头绘制函数。 */
         if (segment->isHead)
         {
-            DrawSnakeHead(segment->position, renderData->direction);
+            DrawSnakeHead(segment->position, renderData->direction, renderData->colorMode);
         }
         else
         {
-            DrawSnakeBodySegment(segment->position, i);
+            DrawSnakeBodySegment(segment->position, i, renderData->colorMode);
         }
     }
 }

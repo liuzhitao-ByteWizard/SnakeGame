@@ -1,5 +1,6 @@
-#ifndef SNAKE_GAME_CORE_H
-#define SNAKE_GAME_CORE_H
+#pragma once
+#ifndef SNAKE_GAME_GAME_CORE_INCLUDED
+#define SNAKE_GAME_GAME_CORE_INCLUDED
 
 #include "DCList.h"
 #include "grid_position.h"
@@ -23,6 +24,22 @@ extern "C" {
     初始蛇头位于地图中间，身体沿着初始方向的反方向排列。
 */
 #define SNAKE_GAME_INITIAL_LENGTH 3
+
+/*
+    Phase 5 的食物、计分、关卡和速度规则常量。
+
+    这些值属于“玩法规则”，所以放在游戏核心层，而不是放在 raylib 界面层。
+    界面以后只负责把这些状态画出来；真正决定一局游戏有几个食物、吃几个
+    食物升级、移动间隔是多少的逻辑，都集中在核心层，方便 Google Test
+    不打开窗口也能验证规则。
+*/
+#define SNAKE_GAME_INITIAL_FOOD_COUNT 5
+#define SNAKE_GAME_MAX_FOOD_COUNT 12
+#define SNAKE_GAME_FOODS_PER_LEVEL 5
+#define SNAKE_GAME_FOOD_GROWTH_LEVEL_INTERVAL 2
+#define SNAKE_GAME_INITIAL_MOVE_INTERVAL_MS 180
+#define SNAKE_GAME_MOVE_INTERVAL_STEP_MS 10
+#define SNAKE_GAME_MIN_MOVE_INTERVAL_MS 80
 
 /*
     蛇的移动方向。
@@ -51,7 +68,17 @@ typedef enum SnakeGameStatus
     SNAKE_GAME_STATUS_RUNNING,
     SNAKE_GAME_STATUS_DEAD
 } SnakeGameStatus;
+/*
+    蛇的颜色模式。
 
+    核心层只保存颜色语义，不保存 raylib 的 Color。这样 Google Test 可以验证
+    “吃到红苹果后蛇变红”，而界面层再把 GREEN/RED 翻译成实际绘制颜色。
+*/
+typedef enum SnakeColorMode
+{
+    SNAKE_COLOR_MODE_GREEN = 0,
+    SNAKE_COLOR_MODE_RED
+} SnakeColorMode;
 /*
     贪吃蛇游戏核心的完整数据。
 
@@ -70,7 +97,16 @@ typedef struct SnakeGameCore
     int snakeLength;             /* 当前蛇身长度，也就是链表中的真实节点数量。 */
     SnakeDirection direction;    /* 当前移动方向，Phase 2 初始为向右。 */
     SnakeGameStatus status;      /* 当前游戏状态，供界面层判断该显示哪类画面。 */
-    DCListNode* snakeBody;       /* 蛇身链表；哨兵节点本身不代表蛇身。 */
+    SnakeColorMode snakeColorMode; /* 当前蛇的颜色模式；初始绿色，吃到红苹果后永久变红。 */
+    DCListNode* snakeBody;       /* 蛇身仍然只由双向循环链表保存；哨兵节点本身不是身体，只负责连接头尾。 */
+    int score;                   /* 当前分数；本项目规则中，每吃 1 个食物就加 1 分。 */
+    int foodsEaten;              /* 本局累计吃到的食物数；数值暂时等于 score，后续结束界面会单独展示它。 */
+    int level;                   /* 当前等级；从 1 开始，每吃 5 个食物提升 1 级。 */
+    int moveIntervalMs;          /* 当前移动间隔，单位毫秒；数值越小，蛇移动越快。 */
+    int targetFoodCount;         /* 当前等级希望地图上维持的食物数量；吃掉后会补齐到这个目标值。 */
+    int foodCount;               /* foods 数组中当前真实有效的食物数量，只读取 [0, foodCount) 范围。 */
+    SnakeGridPosition foods[SNAKE_GAME_MAX_FOOD_COUNT]; /* 多食物并存时，每个元素保存一个苹果所在的网格坐标。 */
+    unsigned int randomState;    /* 核心层自己的伪随机状态；固定种子让测试可以稳定复现食物位置。 */
 } SnakeGameCore;
 
 /*
@@ -85,6 +121,15 @@ typedef struct SnakeGameCore
     返回 true 表示初始化成功；传入 NULL 时返回 false。
 */
 bool SnakeGameInit(SnakeGameCore* game);
+
+/*
+    使用指定随机种子初始化游戏核心。
+
+    正式游戏入口 SnakeGameInit 会用当前时间作为种子，让每局食物位置不同；
+    单元测试则调用这个接口传入固定种子，这样食物生成顺序稳定，测试失败时
+    可以完全复现同一张地图和同一批食物。
+*/
+bool SnakeGameInitWithSeed(SnakeGameCore* game, unsigned int seed);
 
 /*
     销毁游戏核心持有的链表资源。
@@ -109,6 +154,16 @@ int SnakeGameGetMapRows(const SnakeGameCore* game);
 int SnakeGameGetSnakeLength(const SnakeGameCore* game);
 SnakeDirection SnakeGameGetDirection(const SnakeGameCore* game);
 SnakeGameStatus SnakeGameGetStatus(const SnakeGameCore* game);
+SnakeColorMode SnakeGameGetSnakeColorMode(const SnakeGameCore* game);
+/* Phase 5 新增的只读查询接口：界面和测试只能读这些值，不直接改核心状态。 */
+int SnakeGameGetScore(const SnakeGameCore* game);
+int SnakeGameGetFoodsEaten(const SnakeGameCore* game);
+int SnakeGameGetLevel(const SnakeGameCore* game);
+int SnakeGameGetMoveIntervalMs(const SnakeGameCore* game);
+int SnakeGameGetFoodCount(const SnakeGameCore* game);
+int SnakeGameGetTargetFoodCount(const SnakeGameCore* game);
+/* 按下标读取一个食物坐标；index 必须在 [0, foodCount) 内。 */
+bool SnakeGameGetFoodPosition(const SnakeGameCore* game, int index, SnakeGridPosition* outPosition);
 /* 请求改变移动方向；具体的禁止反向规则由 game_core.c 在执行语句前说明。 */
 bool SnakeGameRequestDirection(SnakeGameCore* game, SnakeDirection requestedDirection);
 

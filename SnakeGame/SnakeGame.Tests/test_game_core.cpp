@@ -51,6 +51,186 @@ void ReplaceSnake(
     game->direction = direction;
     game->status = SNAKE_GAME_STATUS_RUNNING;
 }
+
+// 坐标比较在食物、蛇身、目标格验证里会反复使用，单独封装让断言更像规则描述。
+bool PositionsEqual(const SnakeGridPosition& first, const SnakeGridPosition& second)
+{
+    return first.x == second.x && first.y == second.y;
+}
+
+// 测试层也按核心的 30 x 20 网格判断边界，避免把非法坐标摆进测试蛇身。
+bool IsInsideCoreMap(const SnakeGridPosition& position)
+{
+    return position.x >= 0 &&
+        position.y >= 0 &&
+        position.x < SNAKE_GAME_GRID_COLUMNS &&
+        position.y < SNAKE_GAME_GRID_ROWS;
+}
+
+// 通过公开 getter 查找食物，测试不直接读取 game->foods，保持和界面层一样的使用方式。
+bool IsFoodAt(const SnakeGameCore* game, const SnakeGridPosition& position)
+{
+    for (int i = 0; i < SnakeGameGetFoodCount(game); ++i)
+    {
+        SnakeGridPosition food{};
+        if (SnakeGameGetFoodPosition(game, i, &food) && PositionsEqual(food, position))
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+// 验证“食物不能生成在蛇身上”：逐节读取链表蛇身并和食物坐标比较。
+bool IsFoodOnSnake(const SnakeGameCore* game, const SnakeGridPosition& food)
+{
+    for (int i = 0; i < SnakeGameGetSnakeLength(game); ++i)
+    {
+        SnakeGridPosition segment{};
+        if (SnakeGameGetSnakeSegment(game, i, &segment) && PositionsEqual(segment, food))
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+// 统一检查一批食物的基本不变量：数量合法、在地图内、不压蛇身、不互相重叠。
+void ExpectFoodsAreValid(const SnakeGameCore* game)
+{
+    ASSERT_GE(SnakeGameGetFoodCount(game), 0);
+    ASSERT_LE(SnakeGameGetFoodCount(game), SNAKE_GAME_MAX_FOOD_COUNT);
+
+    for (int i = 0; i < SnakeGameGetFoodCount(game); ++i)
+    {
+        SnakeGridPosition food{};
+        ASSERT_TRUE(SnakeGameGetFoodPosition(game, i, &food));
+        EXPECT_TRUE(IsInsideCoreMap(food));
+        EXPECT_FALSE(IsFoodOnSnake(game, food));
+
+        for (int j = i + 1; j < SnakeGameGetFoodCount(game); ++j)
+        {
+            SnakeGridPosition otherFood{};
+            ASSERT_TRUE(SnakeGameGetFoodPosition(game, j, &otherFood));
+            EXPECT_FALSE(PositionsEqual(food, otherFood));
+        }
+    }
+}
+
+// 为了测试“下一步吃到某个目标格”，临时摆出一条长度为 3 的直蛇。
+// 目标格会放在蛇头正前方，这样调用一次 SnakeGameStep 就能稳定命中目标。
+bool TryArrangeSnakeForTarget(
+    SnakeGameCore* game,
+    const SnakeGridPosition& target,
+    SnakeGridPosition* oldTail)
+{
+    struct DirectionVector
+    {
+        SnakeDirection direction;
+        int dx;
+        int dy;
+    };
+
+    const DirectionVector directions[] = {
+        { SNAKE_DIRECTION_RIGHT, 1, 0 },
+        { SNAKE_DIRECTION_LEFT, -1, 0 },
+        { SNAKE_DIRECTION_DOWN, 0, 1 },
+        { SNAKE_DIRECTION_UP, 0, -1 },
+    };
+
+    for (const DirectionVector& vector : directions)
+    {
+        // 根据移动方向反推蛇头、身体、尾巴位置，保证目标格正好是下一格蛇头。
+        const SnakeGridPosition head = { target.x - vector.dx, target.y - vector.dy };
+        const SnakeGridPosition body = { head.x - vector.dx, head.y - vector.dy };
+        const SnakeGridPosition tail = { body.x - vector.dx, body.y - vector.dy };
+
+        if (!IsInsideCoreMap(head) || !IsInsideCoreMap(body) || !IsInsideCoreMap(tail))
+        {
+            continue;
+        }
+
+        // 测试蛇身不能压住现有食物，否则会破坏“食物不在蛇身上”的前置条件。
+        if (IsFoodAt(game, head) || IsFoodAt(game, body) || IsFoodAt(game, tail))
+        {
+            continue;
+        }
+
+        const SnakeGridPosition segments[] = {
+            head,
+            body,
+            tail,
+        };
+        ReplaceSnake(game, segments, 3, vector.direction);
+
+        if (oldTail != nullptr)
+        {
+            *oldTail = tail;
+        }
+
+        return true;
+    }
+
+    return false;
+}
+
+// 从当前食物列表里挑一个能摆蛇吃到的位置；这样测试不依赖具体随机坐标。
+bool ArrangeSnakeToEatAnyFood(
+    SnakeGameCore* game,
+    SnakeGridPosition* eatenFood,
+    SnakeGridPosition* oldTail)
+{
+    for (int i = 0; i < SnakeGameGetFoodCount(game); ++i)
+    {
+        SnakeGridPosition food{};
+        if (!SnakeGameGetFoodPosition(game, i, &food))
+        {
+            continue;
+        }
+
+        if (TryArrangeSnakeForTarget(game, food, oldTail))
+        {
+            if (eatenFood != nullptr)
+            {
+                *eatenFood = food;
+            }
+
+            return true;
+        }
+    }
+
+    return false;
+}
+
+// 找一个没有食物的目标格，摆蛇后推进一步，用来验证普通移动不会增长和加分。
+bool ArrangeSnakeToMoveToEmptyCell(SnakeGameCore* game, SnakeGridPosition* target)
+{
+    for (int y = 0; y < SNAKE_GAME_GRID_ROWS; ++y)
+    {
+        for (int x = 0; x < SNAKE_GAME_GRID_COLUMNS; ++x)
+        {
+            const SnakeGridPosition candidate = { x, y };
+            if (IsFoodAt(game, candidate))
+            {
+                continue;
+            }
+
+            if (TryArrangeSnakeForTarget(game, candidate, nullptr))
+            {
+                if (target != nullptr)
+                {
+                    *target = candidate;
+                }
+
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
 }
 
 TEST(GameCorePhase2, InitializesMapDirectionAndInitialSnake)
@@ -475,6 +655,212 @@ TEST(GameCorePhase4, MovingIntoOldTailCellIsAllowedBecauseTailMovesAway)
     // 移动后蛇头应该正好在旧尾所在的 (4,5)，用来证明“旧尾不算自撞”。
     ASSERT_TRUE(SnakeGameGetSnakeHead(&game, &head));
     ExpectPosition(head, 4, 5);
+
+    SnakeGameDestroy(&game);
+}
+
+// 固定种子初始化应该生成确定且合法的初始食物集合。
+TEST(GameCorePhase5, SeededInitializationCreatesFiveValidFoods)
+{
+    SnakeGameCore game{};
+    ASSERT_TRUE(SnakeGameInitWithSeed(&game, 12345u));
+
+    EXPECT_EQ(0, SnakeGameGetScore(&game));
+    EXPECT_EQ(0, SnakeGameGetFoodsEaten(&game));
+    EXPECT_EQ(1, SnakeGameGetLevel(&game));
+    EXPECT_EQ(SNAKE_GAME_INITIAL_MOVE_INTERVAL_MS, SnakeGameGetMoveIntervalMs(&game));
+    EXPECT_EQ(SNAKE_GAME_INITIAL_FOOD_COUNT, SnakeGameGetFoodCount(&game));
+    EXPECT_EQ(SNAKE_GAME_INITIAL_FOOD_COUNT, SnakeGameGetTargetFoodCount(&game));
+    ExpectFoodsAreValid(&game);
+
+    SnakeGameDestroy(&game);
+}
+
+// 吃到食物时，核心应该加分、增长，并保留旧尾巴来体现“不删尾”。
+TEST(GameCorePhase5, EatingFoodIncreasesScoreAndKeepsOldTail)
+{
+    SnakeGameCore game{};
+    ASSERT_TRUE(SnakeGameInitWithSeed(&game, 24680u));
+
+    SnakeGridPosition eatenFood{};
+    SnakeGridPosition oldTail{};
+    ASSERT_TRUE(ArrangeSnakeToEatAnyFood(&game, &eatenFood, &oldTail));
+
+    ASSERT_TRUE(SnakeGameStep(&game));
+    EXPECT_EQ(SNAKE_GAME_STATUS_RUNNING, SnakeGameGetStatus(&game));
+    EXPECT_EQ(1, SnakeGameGetScore(&game));
+    EXPECT_EQ(1, SnakeGameGetFoodsEaten(&game));
+    EXPECT_EQ(SNAKE_GAME_INITIAL_LENGTH + 1, SnakeGameGetSnakeLength(&game));
+
+    SnakeGridPosition head{};
+    SnakeGridPosition tail{};
+    ASSERT_TRUE(SnakeGameGetSnakeHead(&game, &head));
+    ASSERT_TRUE(SnakeGameGetSnakeTail(&game, &tail));
+    ExpectPosition(head, eatenFood.x, eatenFood.y);
+    ExpectPosition(tail, oldTail.x, oldTail.y);
+
+    EXPECT_EQ(SNAKE_GAME_INITIAL_FOOD_COUNT, SnakeGameGetFoodCount(&game));
+    ExpectFoodsAreValid(&game);
+
+    SnakeGameDestroy(&game);
+}
+
+// 没吃到食物时仍然是普通移动：头插尾删，长度和分数都不变。
+TEST(GameCorePhase5, NormalMoveWithoutFoodKeepsLengthAndScore)
+{
+    SnakeGameCore game{};
+    ASSERT_TRUE(SnakeGameInitWithSeed(&game, 13579u));
+
+    SnakeGridPosition target{};
+    ASSERT_TRUE(ArrangeSnakeToMoveToEmptyCell(&game, &target));
+
+    ASSERT_TRUE(SnakeGameStep(&game));
+    EXPECT_EQ(SNAKE_GAME_INITIAL_LENGTH, SnakeGameGetSnakeLength(&game));
+    EXPECT_EQ(0, SnakeGameGetScore(&game));
+    EXPECT_EQ(0, SnakeGameGetFoodsEaten(&game));
+
+    SnakeGridPosition head{};
+    ASSERT_TRUE(SnakeGameGetSnakeHead(&game, &head));
+    ExpectPosition(head, target.x, target.y);
+    ExpectFoodsAreValid(&game);
+
+    SnakeGameDestroy(&game);
+}
+
+// 连续吃 5 个食物后，应触发第一次升级，并同步速度和目标食物数量。
+TEST(GameCorePhase5, EatingFiveFoodsRaisesLevelAndUpdatesSpeedAndFoodTarget)
+{
+    SnakeGameCore game{};
+    ASSERT_TRUE(SnakeGameInitWithSeed(&game, 777u));
+
+    for (int i = 0; i < SNAKE_GAME_FOODS_PER_LEVEL; ++i)
+    {
+        ASSERT_TRUE(ArrangeSnakeToEatAnyFood(&game, nullptr, nullptr));
+        ASSERT_TRUE(SnakeGameStep(&game));
+        ExpectFoodsAreValid(&game);
+    }
+
+    EXPECT_EQ(5, SnakeGameGetScore(&game));
+    EXPECT_EQ(5, SnakeGameGetFoodsEaten(&game));
+    EXPECT_EQ(2, SnakeGameGetLevel(&game));
+    EXPECT_EQ(170, SnakeGameGetMoveIntervalMs(&game));
+    EXPECT_EQ(6, SnakeGameGetTargetFoodCount(&game));
+    EXPECT_EQ(6, SnakeGameGetFoodCount(&game));
+
+    SnakeGameDestroy(&game);
+}
+
+// 长局测试：验证食物数量不会超过 12，移动间隔不会低于 80ms。
+TEST(GameCorePhase5, FoodTargetCapsAtTwelveAndSpeedNeverDropsBelowFloor)
+{
+    SnakeGameCore game{};
+    ASSERT_TRUE(SnakeGameInitWithSeed(&game, 98765u));
+
+    for (int i = 0; i < 70; ++i)
+    {
+        ASSERT_TRUE(ArrangeSnakeToEatAnyFood(&game, nullptr, nullptr));
+        ASSERT_TRUE(SnakeGameStep(&game));
+
+        const int expectedLevel = SnakeGameGetFoodsEaten(&game) / SNAKE_GAME_FOODS_PER_LEVEL + 1;
+        int expectedTargetFoodCount = SNAKE_GAME_INITIAL_FOOD_COUNT + expectedLevel / SNAKE_GAME_FOOD_GROWTH_LEVEL_INTERVAL;
+        if (expectedTargetFoodCount > SNAKE_GAME_MAX_FOOD_COUNT)
+        {
+            expectedTargetFoodCount = SNAKE_GAME_MAX_FOOD_COUNT;
+        }
+
+        EXPECT_EQ(expectedLevel, SnakeGameGetLevel(&game));
+        EXPECT_EQ(expectedTargetFoodCount, SnakeGameGetTargetFoodCount(&game));
+        EXPECT_EQ(expectedTargetFoodCount, SnakeGameGetFoodCount(&game));
+        EXPECT_GE(SnakeGameGetMoveIntervalMs(&game), SNAKE_GAME_MIN_MOVE_INTERVAL_MS);
+        ExpectFoodsAreValid(&game);
+    }
+
+    EXPECT_EQ(15, SnakeGameGetLevel(&game));
+    EXPECT_EQ(SNAKE_GAME_MAX_FOOD_COUNT, SnakeGameGetTargetFoodCount(&game));
+    EXPECT_EQ(SNAKE_GAME_MAX_FOOD_COUNT, SnakeGameGetFoodCount(&game));
+    EXPECT_EQ(SNAKE_GAME_MIN_MOVE_INTERVAL_MS, SnakeGameGetMoveIntervalMs(&game));
+
+    SnakeGameDestroy(&game);
+}
+
+// 颜色规则：开局还没有吃红苹果，蛇应该保持默认绿色。
+TEST(GameCorePhase5, SnakeColorStartsGreen)
+{
+    SnakeGameCore game{};
+    ASSERT_TRUE(SnakeGameInitWithSeed(&game, 1122u));
+
+    EXPECT_EQ(SNAKE_COLOR_MODE_GREEN, SnakeGameGetSnakeColorMode(&game));
+
+    SnakeGameDestroy(&game);
+}
+
+// 普通移动没有吃到红苹果，颜色不应该变化，仍然保持绿色。
+TEST(GameCorePhase5, NormalMoveKeepsSnakeGreen)
+{
+    SnakeGameCore game{};
+    ASSERT_TRUE(SnakeGameInitWithSeed(&game, 2233u));
+
+    ASSERT_TRUE(ArrangeSnakeToMoveToEmptyCell(&game, nullptr));
+    ASSERT_TRUE(SnakeGameStep(&game));
+
+    EXPECT_EQ(SNAKE_COLOR_MODE_GREEN, SnakeGameGetSnakeColorMode(&game));
+
+    SnakeGameDestroy(&game);
+}
+
+// 吃到红苹果后，核心层颜色模式应该永久切换为红色，供界面层绘制红蛇。
+TEST(GameCorePhase5, SnakeStartsGreenAndTurnsRedAfterEatingFood)
+{
+    SnakeGameCore game{};
+    ASSERT_TRUE(SnakeGameInitWithSeed(&game, 3344u));
+    ASSERT_EQ(SNAKE_COLOR_MODE_GREEN, SnakeGameGetSnakeColorMode(&game));
+
+    ASSERT_TRUE(ArrangeSnakeToEatAnyFood(&game, nullptr, nullptr));
+    ASSERT_TRUE(SnakeGameStep(&game));
+
+    EXPECT_EQ(SNAKE_COLOR_MODE_RED, SnakeGameGetSnakeColorMode(&game));
+
+    SnakeGameDestroy(&game);
+}
+
+// 变红是本局永久状态：吃过红苹果后，即使后续只是普通移动，也不恢复绿色。
+TEST(GameCorePhase5, RedSnakeStaysRedAfterLaterNormalMove)
+{
+    SnakeGameCore game{};
+    ASSERT_TRUE(SnakeGameInitWithSeed(&game, 4455u));
+
+    ASSERT_TRUE(ArrangeSnakeToEatAnyFood(&game, nullptr, nullptr));
+    ASSERT_TRUE(SnakeGameStep(&game));
+    ASSERT_EQ(SNAKE_COLOR_MODE_RED, SnakeGameGetSnakeColorMode(&game));
+
+    ASSERT_TRUE(ArrangeSnakeToMoveToEmptyCell(&game, nullptr));
+    ASSERT_TRUE(SnakeGameStep(&game));
+
+    EXPECT_EQ(SNAKE_COLOR_MODE_RED, SnakeGameGetSnakeColorMode(&game));
+
+    SnakeGameDestroy(&game);
+}
+
+// 死亡只改变游戏状态，不重置本局蛇的颜色；红蛇撞墙后仍然记录为红色。
+TEST(GameCorePhase5, RedSnakeStaysRedAfterDeath)
+{
+    SnakeGameCore game{};
+    ASSERT_TRUE(SnakeGameInitWithSeed(&game, 5566u));
+
+    ASSERT_TRUE(ArrangeSnakeToEatAnyFood(&game, nullptr, nullptr));
+    ASSERT_TRUE(SnakeGameStep(&game));
+    ASSERT_EQ(SNAKE_COLOR_MODE_RED, SnakeGameGetSnakeColorMode(&game));
+
+    const SnakeGridPosition wallCrashSnake[] = {
+        { 29, 5 },
+        { 28, 5 },
+        { 27, 5 },
+    };
+    ReplaceSnake(&game, wallCrashSnake, 3, SNAKE_DIRECTION_RIGHT);
+
+    ASSERT_TRUE(SnakeGameStep(&game));
+    EXPECT_EQ(SNAKE_GAME_STATUS_DEAD, SnakeGameGetStatus(&game));
+    EXPECT_EQ(SNAKE_COLOR_MODE_RED, SnakeGameGetSnakeColorMode(&game));
 
     SnakeGameDestroy(&game);
 }
