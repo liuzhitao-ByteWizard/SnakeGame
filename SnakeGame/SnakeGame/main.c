@@ -22,6 +22,24 @@
 /* 定义最高分文本文件名，文件会放在程序运行时的工作目录中。 */
 #define HIGH_SCORE_FILE_PATH "highscore.txt"
 
+/* 定义吃食物音效文件名，界面层只关心播放声音，不把声音概念放进核心规则。 */
+#define SOUND_FILE_EAT "eat.wav"
+
+/* 定义升级音效文件名，升级事件由核心层的等级变化推导出来。 */
+#define SOUND_FILE_LEVEL "level.wav"
+
+/* 定义死亡音效文件名，死亡事件由核心层的状态变化推导出来。 */
+#define SOUND_FILE_DEATH "death.wav"
+
+/* 定义吃食物反馈时长，让闪光和蛇头缩放能在短时间内自然消失。 */
+#define EAT_FEEDBACK_DURATION 0.26f
+
+/* 定义升级提示时长，让玩家能看到升级但不会挡住操作太久。 */
+#define LEVEL_FEEDBACK_DURATION 0.90f
+
+/* 定义死亡反馈时长，让红色闪烁和棋盘抖动集中在死亡瞬间。 */
+#define DEATH_FEEDBACK_DURATION 0.55f
+
 #define BOARD_WIDTH (GRID_COLUMNS * CELL_SIZE)
 #define BOARD_HEIGHT (GRID_ROWS * CELL_SIZE)
 #define WINDOW_WIDTH (WINDOW_PADDING * 2 + BOARD_WIDTH + PANEL_GAP + INFO_PANEL_WIDTH)
@@ -70,6 +88,27 @@ typedef struct SnakeRenderData
     SnakeDirection direction;
     SnakeColorMode colorMode;
 } SnakeRenderData;
+
+/* 保存界面层短暂反馈状态，核心层只负责规则结果，闪光和抖动留给 raylib 界面层处理。 */
+typedef struct UiFeedbackState
+{
+    float eatTimer;
+    float levelTimer;
+    float deathTimer;
+    SnakeGridPosition eatPosition;
+    bool hasEatPosition;
+} UiFeedbackState;
+
+/* 保存已经加载好的音效，加载失败时只关闭对应开关，游戏流程继续正常运行。 */
+typedef struct UiSoundBank
+{
+    Sound eatSound;
+    Sound levelSound;
+    Sound deathSound;
+    bool eatLoaded;
+    bool levelLoaded;
+    bool deathLoaded;
+} UiSoundBank;
 
 
 static Rectangle GridCellToRectangle(int gridX, int gridY)
@@ -126,6 +165,384 @@ static bool BuildSnakeRenderData(const SnakeGameCore* game, SnakeRenderData* ren
     }
 
     return true;
+}
+
+static float Clamp01(float value)
+{
+    /* 小于 0 的透明度和比例没有绘制意义，所以先压到 0。 */
+    if (value < 0.0f)
+    {
+        return 0.0f;
+    }
+
+    /* 大于 1 的反馈进度会让颜色过亮，所以再压到 1。 */
+    if (value > 1.0f)
+    {
+        return 1.0f;
+    }
+
+    /* 正常范围内的值可以直接返回。 */
+    return value;
+}
+
+static void ResetUiFeedback(UiFeedbackState* feedback)
+{
+    /* 界面反馈状态只影响视觉和声音，重开或开始时清零不会改变核心规则。 */
+    if (feedback == NULL)
+    {
+        return;
+    }
+
+    /* 清空吃食物反馈计时，避免上一局的闪光带到新局。 */
+    feedback->eatTimer = 0.0f;
+
+    /* 清空升级提示计时，避免上一局的升级文字残留。 */
+    feedback->levelTimer = 0.0f;
+
+    /* 清空死亡反馈计时，避免重开后棋盘继续抖动。 */
+    feedback->deathTimer = 0.0f;
+
+    /* 默认没有可绘制的吃食物位置。 */
+    feedback->eatPosition = (SnakeGridPosition){ 0, 0 };
+
+    /* 标记当前没有吃食物闪光点。 */
+    feedback->hasEatPosition = false;
+}
+
+static void UpdateUiFeedback(UiFeedbackState* feedback, float deltaTime)
+{
+    /* 反馈计时属于界面动画，每帧按真实时间衰减，不影响蛇的一格一格移动规则。 */
+    if (feedback == NULL)
+    {
+        return;
+    }
+
+    /* 吃食物计时大于 0 时才需要递减。 */
+    if (feedback->eatTimer > 0.0f)
+    {
+        /* 用帧时间递减，让反馈时长不依赖机器帧率。 */
+        feedback->eatTimer -= deltaTime;
+
+        /* 计时结束后清理吃食物位置，绘制函数就不会再画闪光。 */
+        if (feedback->eatTimer <= 0.0f)
+        {
+            feedback->eatTimer = 0.0f;
+            feedback->hasEatPosition = false;
+        }
+    }
+
+    /* 升级提示计时大于 0 时才需要递减。 */
+    if (feedback->levelTimer > 0.0f)
+    {
+        /* 用同一套帧时间递减，保证所有界面反馈节奏一致。 */
+        feedback->levelTimer -= deltaTime;
+
+        /* 计时结束后压回 0，避免浮点误差留下很小的负数。 */
+        if (feedback->levelTimer < 0.0f)
+        {
+            feedback->levelTimer = 0.0f;
+        }
+    }
+
+    /* 死亡反馈计时大于 0 时才需要递减。 */
+    if (feedback->deathTimer > 0.0f)
+    {
+        /* 死亡抖动和红色覆盖也按真实时间衰减。 */
+        feedback->deathTimer -= deltaTime;
+
+        /* 计时结束后压回 0，让结束界面保持稳定。 */
+        if (feedback->deathTimer < 0.0f)
+        {
+            feedback->deathTimer = 0.0f;
+        }
+    }
+}
+
+static void TriggerEatFeedback(UiFeedbackState* feedback, SnakeGridPosition position)
+{
+    /* 吃食物反馈由分数变化触发，界面层只记录要闪光的格子。 */
+    if (feedback == NULL)
+    {
+        return;
+    }
+
+    /* 记录吃到食物后的蛇头位置，闪光会围绕这个格子绘制。 */
+    feedback->eatPosition = position;
+
+    /* 标记当前有可绘制的吃食物反馈位置。 */
+    feedback->hasEatPosition = true;
+
+    /* 重置吃食物计时，让连续吃食物时反馈从最亮状态重新开始。 */
+    feedback->eatTimer = EAT_FEEDBACK_DURATION;
+}
+
+static void TriggerLevelFeedback(UiFeedbackState* feedback)
+{
+    /* 升级反馈由等级变化触发，核心层不用知道界面上会显示提示文字。 */
+    if (feedback == NULL)
+    {
+        return;
+    }
+
+    /* 重置升级计时，让 LEVEL UP 提示完整显示一小段时间。 */
+    feedback->levelTimer = LEVEL_FEEDBACK_DURATION;
+}
+
+static void TriggerDeathFeedback(UiFeedbackState* feedback)
+{
+    /* 死亡反馈由状态切换触发，核心层只暴露 DEAD 状态，红屏和抖动留在界面层。 */
+    if (feedback == NULL)
+    {
+        return;
+    }
+
+    /* 重置死亡计时，让死亡瞬间有明确的红色和抖动反馈。 */
+    feedback->deathTimer = DEATH_FEEDBACK_DURATION;
+}
+
+static bool TryLoadUiSound(const char* fileName, Sound* outSound)
+{
+    /* 声音路径只在界面层尝试，核心层不依赖 raylib，也不依赖文件系统。 */
+    static const char* pathPrefixes[] = {
+        "../Sound/",
+        "Sound/",
+        "../../Sound/"
+    };
+
+    /* 检查参数，避免加载失败时写入无效地址。 */
+    if (fileName == NULL || outSound == NULL)
+    {
+        return false;
+    }
+
+    /* 按常见工作目录顺序尝试音效路径，适配 Visual Studio 和直接运行。 */
+    for (int i = 0; i < (int)(sizeof(pathPrefixes) / sizeof(pathPrefixes[0])); ++i)
+    {
+        /* 组合当前候选路径，路径短小固定，缓冲区足够容纳项目内资源路径。 */
+        char soundPath[256];
+
+        /* 把目录前缀和文件名拼成 raylib 可以读取的相对路径。 */
+        snprintf(soundPath, sizeof(soundPath), "%s%s", pathPrefixes[i], fileName);
+
+        /* 只有文件存在时才调用 LoadSound，避免 raylib 反复打印找不到文件的日志。 */
+        if (FileExists(soundPath))
+        {
+            /* 加载当前候选音效文件。 */
+            Sound loadedSound = LoadSound(soundPath);
+
+            /* raylib 提供有效性检查，避免把坏音频保存进音效库。 */
+            if (IsSoundValid(loadedSound))
+            {
+                *outSound = loadedSound;
+                return true;
+            }
+        }
+    }
+
+    /* 所有路径都失败时返回 false，调用方会静默跳过对应音效。 */
+    return false;
+}
+
+static UiSoundBank LoadUiSounds(void)
+{
+    /* 默认把所有音效标记为未加载，音频设备不可用时游戏仍然可以玩。 */
+    UiSoundBank sounds = { 0 };
+
+    /* 只有音频设备可用时才加载声音，避免无声设备环境下初始化失败影响游戏。 */
+    if (!IsAudioDeviceReady())
+    {
+        return sounds;
+    }
+
+    /* 加载吃食物音效，失败时 eatLoaded 保持 false。 */
+    sounds.eatLoaded = TryLoadUiSound(SOUND_FILE_EAT, &sounds.eatSound);
+
+    /* 加载升级音效，失败时 levelLoaded 保持 false。 */
+    sounds.levelLoaded = TryLoadUiSound(SOUND_FILE_LEVEL, &sounds.levelSound);
+
+    /* 加载死亡音效，失败时 deathLoaded 保持 false。 */
+    sounds.deathLoaded = TryLoadUiSound(SOUND_FILE_DEATH, &sounds.deathSound);
+
+    /* 返回已经加载好的音效句柄和加载状态。 */
+    return sounds;
+}
+
+static void UnloadUiSounds(UiSoundBank* sounds)
+{
+    /* 卸载函数集中释放 raylib 音效资源，避免退出游戏时留下音频缓冲。 */
+    if (sounds == NULL)
+    {
+        return;
+    }
+
+    /* 只有加载成功的吃食物音效才需要卸载。 */
+    if (sounds->eatLoaded)
+    {
+        UnloadSound(sounds->eatSound);
+        sounds->eatLoaded = false;
+    }
+
+    /* 只有加载成功的升级音效才需要卸载。 */
+    if (sounds->levelLoaded)
+    {
+        UnloadSound(sounds->levelSound);
+        sounds->levelLoaded = false;
+    }
+
+    /* 只有加载成功的死亡音效才需要卸载。 */
+    if (sounds->deathLoaded)
+    {
+        UnloadSound(sounds->deathSound);
+        sounds->deathLoaded = false;
+    }
+}
+
+static void PlayEatSound(const UiSoundBank* sounds)
+{
+    /* 声音播放只跟界面事件绑定，核心层不用知道玩家听到了什么。 */
+    if (sounds != NULL && sounds->eatLoaded)
+    {
+        PlaySound(sounds->eatSound);
+    }
+}
+
+static void PlayLevelSound(const UiSoundBank* sounds)
+{
+    /* 升级音效只在等级发生变化时播放一次。 */
+    if (sounds != NULL && sounds->levelLoaded)
+    {
+        PlaySound(sounds->levelSound);
+    }
+}
+
+static void PlayDeathSound(const UiSoundBank* sounds)
+{
+    /* 死亡音效只在状态刚切到 DEAD 时播放一次。 */
+    if (sounds != NULL && sounds->deathLoaded)
+    {
+        PlaySound(sounds->deathSound);
+    }
+}
+
+static float GetSnakeHeadPulseScale(const UiFeedbackState* feedback)
+{
+    /* 没有吃食物反馈时使用正常大小，保持经典一格一格移动的观感。 */
+    if (feedback == NULL || feedback->eatTimer <= 0.0f)
+    {
+        return 1.0f;
+    }
+
+    /* 反馈剩余时间越多，蛇头越接近最大放大比例。 */
+    const float progress = Clamp01(feedback->eatTimer / EAT_FEEDBACK_DURATION);
+
+    /* 放大幅度控制得很轻，避免蛇头盖住太多相邻格子。 */
+    return 1.0f + progress * 0.16f;
+}
+
+static Vector2 GetBoardShakeOffset(const UiFeedbackState* feedback)
+{
+    /* 默认不抖动，普通游戏过程保持棋盘稳定。 */
+    Vector2 offset = { 0.0f, 0.0f };
+
+    /* 只有死亡反馈计时存在时才计算抖动偏移。 */
+    if (feedback == NULL || feedback->deathTimer <= 0.0f)
+    {
+        return offset;
+    }
+
+    /* 死亡反馈逐渐衰减，让抖动从明显变成稳定。 */
+    const float progress = Clamp01(feedback->deathTimer / DEATH_FEEDBACK_DURATION);
+
+    /* 用计时值切换方向，得到轻微但清楚的撞击感。 */
+    const int shakeStep = (int)(feedback->deathTimer * 80.0f);
+
+    /* 根据奇偶步决定水平抖动方向。 */
+    const float directionX = (shakeStep % 2 == 0) ? 1.0f : -1.0f;
+
+    /* 根据三步节奏决定垂直抖动方向。 */
+    const float directionY = (shakeStep % 3 == 0) ? 1.0f : -1.0f;
+
+    /* 把抖动限制在少量像素内，增强死亡反馈但不破坏布局。 */
+    offset.x = directionX * 4.0f * progress;
+    offset.y = directionY * 2.0f * progress;
+
+    /* 返回给主循环中的相机偏移使用。 */
+    return offset;
+}
+
+static void DrawEatFeedbackFlash(const UiFeedbackState* feedback)
+{
+    /* 没有有效吃食物位置时不绘制闪光。 */
+    if (feedback == NULL || !feedback->hasEatPosition || feedback->eatTimer <= 0.0f)
+    {
+        return;
+    }
+
+    /* 把吃到食物的格子转换成屏幕矩形，闪光就能跟蛇头对齐。 */
+    const Rectangle cell = GridCellToRectangle(feedback->eatPosition.x, feedback->eatPosition.y);
+
+    /* 计算当前反馈进度，用于控制透明度和圆环大小。 */
+    const float progress = Clamp01(feedback->eatTimer / EAT_FEEDBACK_DURATION);
+
+    /* 计算格子中心，圆环和亮点都围绕这个位置绘制。 */
+    const Vector2 center = { cell.x + cell.width * 0.50f, cell.y + cell.height * 0.50f };
+
+    /* 绘制向外扩散的绿色亮环，提示玩家刚刚吃到了食物。 */
+    DrawRing(center, cell.width * 0.22f, cell.width * (0.52f - progress * 0.12f), 0.0f, 360.0f, 32, Fade(kAccentGreen, 0.58f * progress));
+
+    /* 绘制中心短闪白光，让吃食物反馈更容易被看见。 */
+    DrawCircleV(center, cell.width * 0.18f * progress, Fade(WHITE, 0.38f * progress));
+}
+
+static void DrawLevelFeedback(const UiFeedbackState* feedback)
+{
+    /* 没有升级计时时不绘制升级提示。 */
+    if (feedback == NULL || feedback->levelTimer <= 0.0f)
+    {
+        return;
+    }
+
+    /* 使用剩余时间控制透明度，让文字自然淡出。 */
+    const float progress = Clamp01(feedback->levelTimer / LEVEL_FEEDBACK_DURATION);
+
+    /* 固定升级提示文字，避免在紧凑棋盘上产生额外布局变化。 */
+    const char* text = "LEVEL UP";
+
+    /* 先测量文字宽度，保证提示始终居中。 */
+    const int fontSize = 34;
+
+    /* 根据文字宽度计算居中位置。 */
+    const int textWidth = MeasureText(text, fontSize);
+
+    /* 提示放在棋盘上方区域，不遮挡右侧信息栏。 */
+    const int textX = BOARD_X + (BOARD_WIDTH - textWidth) / 2;
+
+    /* 提示略微靠上，玩家看得到但不会挡住蛇头附近操作。 */
+    const int textY = BOARD_Y + 52;
+
+    /* 先绘制轻微阴影，保证深色棋盘和红色覆盖下文字仍清晰。 */
+    DrawText(text, textX + 2, textY + 2, fontSize, Fade(BLACK, 0.45f * progress));
+
+    /* 再绘制主文字，用绿色强调升级成功。 */
+    DrawText(text, textX, textY, fontSize, Fade(kAccentGreen, progress));
+}
+
+static void DrawDeathFeedback(const UiFeedbackState* feedback)
+{
+    /* 没有死亡计时时不绘制红色覆盖。 */
+    if (feedback == NULL || feedback->deathTimer <= 0.0f)
+    {
+        return;
+    }
+
+    /* 使用剩余时间控制红色覆盖透明度，让死亡瞬间更明显。 */
+    const float progress = Clamp01(feedback->deathTimer / DEATH_FEEDBACK_DURATION);
+
+    /* 在棋盘范围内绘制红色覆盖，强调撞墙或自撞已经发生。 */
+    DrawRectangle(BOARD_X, BOARD_Y, BOARD_WIDTH, BOARD_HEIGHT, Fade(kAppleRed, 0.24f * progress));
+
+    /* 绘制一圈红色边框，让死亡反馈和普通暂停覆盖区分开。 */
+    DrawRectangleLines(BOARD_X, BOARD_Y, BOARD_WIDTH, BOARD_HEIGHT, Fade(kAppleRed, 0.78f * progress));
 }
 
 static void HandleDirectionInput(SnakeGameCore* game)
@@ -195,7 +612,7 @@ static void UpdateHighScoreAfterDeath(const SnakeGameCore* game, int* highScore)
     }
 }
 
-static void HandleGameInput(SnakeGameCore* game, float* moveTimer)
+static void HandleGameInput(SnakeGameCore* game, float* moveTimer, UiFeedbackState* feedback)
 {
     if (game == NULL || moveTimer == NULL)
     {
@@ -215,11 +632,17 @@ static void HandleGameInput(SnakeGameCore* game, float* moveTimer)
     {
         if (status == SNAKE_GAME_STATUS_READY)
         {
+            /* 清空界面反馈，确保开始时没有上一轮残留的闪光或抖动。 */
+            ResetUiFeedback(feedback);
+
             SnakeGameStart(game);
             *moveTimer = 0.0f;
         }
         else if (status == SNAKE_GAME_STATUS_DEAD)
         {
+            /* 清空界面反馈，确保死亡后再来一局时画面立即恢复稳定。 */
+            ResetUiFeedback(feedback);
+
             SnakeGameRestart(game);
             *moveTimer = 0.0f;
         }
@@ -236,6 +659,9 @@ static void HandleGameInput(SnakeGameCore* game, float* moveTimer)
         const SnakeGameStatus currentStatus = SnakeGameGetStatus(game);
         if (currentStatus == SNAKE_GAME_STATUS_RUNNING || currentStatus == SNAKE_GAME_STATUS_PAUSED)
         {
+            /* 清空界面反馈，确保游戏中重开不会继承当前局的反馈动画。 */
+            ResetUiFeedback(feedback);
+
             SnakeGameRestart(game);
             *moveTimer = 0.0f;
         }
@@ -338,7 +764,7 @@ static void DrawSnakeBodySegment(SnakeGridPosition position, int segmentIndex, S
 }
 
 
-static void DrawSnakeHead(SnakeGridPosition position, SnakeDirection direction, SnakeColorMode colorMode)
+static void DrawSnakeHead(SnakeGridPosition position, SnakeDirection direction, SnakeColorMode colorMode, float pulseScale)
 {
 
     Rectangle headRect = GridCellToRectangle(position.x, position.y);
@@ -346,6 +772,15 @@ static void DrawSnakeHead(SnakeGridPosition position, SnakeDirection direction, 
     headRect.y += 2.0f;
     headRect.width -= 4.0f;
     headRect.height -= 4.0f;
+
+    /* 根据吃食物反馈轻微放大蛇头，仍然保持一格一格跳动，不做平滑移动。 */
+    const float pulseExtra = (pulseScale - 1.0f) * CELL_SIZE * 0.50f;
+
+    /* 从中心向外扩展矩形，避免放大时蛇头偏向某一边。 */
+    headRect.x -= pulseExtra;
+    headRect.y -= pulseExtra;
+    headRect.width += pulseExtra * 2.0f;
+    headRect.height += pulseExtra * 2.0f;
 
 
     const Color headColor = (colorMode == SNAKE_COLOR_MODE_RED) ? kSnakeRedHeadColor : kSnakeHeadColor;
@@ -400,7 +835,7 @@ static void DrawSnakeHead(SnakeGridPosition position, SnakeDirection direction, 
     DrawLineEx(mouthStart, mouthEnd, 1.6f, kSnakeMouthColor);
 }
 
-static void DrawSnake(const SnakeRenderData* renderData)
+static void DrawSnake(const SnakeRenderData* renderData, const UiFeedbackState* feedback)
 {
     if (renderData == NULL)
     {
@@ -415,7 +850,10 @@ static void DrawSnake(const SnakeRenderData* renderData)
 
         if (segment->isHead)
         {
-            DrawSnakeHead(segment->position, renderData->direction, renderData->colorMode);
+            /* 只有蛇头参与吃食物缩放反馈，蛇身仍然按链表节点逐节绘制。 */
+            const float pulseScale = GetSnakeHeadPulseScale(feedback);
+
+            DrawSnakeHead(segment->position, renderData->direction, renderData->colorMode, pulseScale);
         }
         else
         {
@@ -675,7 +1113,7 @@ static void DrawInfoPanel(const SnakeGameCore* game, int highScore)
     DrawText("SNAKE", PANEL_X + 22, PANEL_Y + 24, 34, kTitleColor);
 
     /* 绘制当前阶段说明。 */
-    DrawText("Phase 7 Save", PANEL_X + 24, PANEL_Y + 64, 18, kMutedTextColor);
+    DrawText("Phase 8 Polish", PANEL_X + 24, PANEL_Y + 64, 18, kMutedTextColor);
 
     /* 绘制右上角苹果装饰的红色果身。 */
     DrawCircle(PANEL_X + INFO_PANEL_WIDTH - 48, PANEL_Y + 45, 13.0f, kAppleRed);
@@ -722,8 +1160,20 @@ int main(void)
     /* 开启垂直同步，让画面刷新更稳定。 */
     SetConfigFlags(FLAG_VSYNC_HINT);
 
-    /* 创建固定尺寸窗口，并在标题中标明当前 Phase 7 已接入本地存档。 */
-    InitWindow(WINDOW_WIDTH, WINDOW_HEIGHT, "SnakeGame - Phase 7 Save");
+    /* 创建固定尺寸窗口，并在标题中标明当前 Phase 8 已接入反馈和音效打磨。 */
+    InitWindow(WINDOW_WIDTH, WINDOW_HEIGHT, "SnakeGame - Phase 8 Polish");
+
+    /* 初始化音频设备，音效属于 raylib 界面层资源，不进入 game_core。 */
+    InitAudioDevice();
+
+    /* 加载三种界面音效，失败时只跳过声音，不影响游戏玩法。 */
+    UiSoundBank sounds = LoadUiSounds();
+
+    /* 准备界面反馈状态，吃食物、升级、死亡都会通过这个状态绘制短动画。 */
+    UiFeedbackState feedback;
+
+    /* 初始化反馈状态，保证第一帧没有随机残留动画。 */
+    ResetUiFeedback(&feedback);
 
     /* 设置目标帧率为 60 帧，移动节奏仍由核心层的毫秒间隔控制。 */
     SetTargetFPS(60);
@@ -734,7 +1184,16 @@ int main(void)
     /* 初始化核心状态，准备初始蛇身、初始食物和 READY 状态。 */
     if (!SnakeGameInit(&game))
     {
-        /* 如果核心状态初始化失败，先关闭窗口资源。 */
+        /* 如果核心状态初始化失败，先按创建顺序反向释放界面资源。 */
+        /* 初始化失败时先释放已经尝试加载的音效资源。 */
+        UnloadUiSounds(&sounds);
+
+        /* 初始化失败时关闭音频设备，保证 raylib 资源成对释放。 */
+        if (IsAudioDeviceReady())
+        {
+            CloseAudioDevice();
+        }
+
         CloseWindow();
 
         /* 返回非 0 值，表示程序启动失败。 */
@@ -760,8 +1219,14 @@ int main(void)
     /* 只要窗口没有请求关闭，就持续运行游戏主循环。 */
     while (!WindowShouldClose())
     {
+        /* 读取本帧真实耗时，移动计时和反馈动画共用同一个时间来源。 */
+        const float frameTime = GetFrameTime();
+
+        /* 每帧衰减界面反馈计时，动画结束后自动停止绘制。 */
+        UpdateUiFeedback(&feedback, frameTime);
+
         /* 先处理键盘输入，把 Enter、P、R 和方向键转换成核心层命令。 */
-        HandleGameInput(&game, &moveTimer);
+        HandleGameInput(&game, &moveTimer, &feedback);
 
         /* 只有 RUNNING 状态才推进蛇的移动。 */
         if (SnakeGameGetStatus(&game) == SNAKE_GAME_STATUS_RUNNING)
@@ -770,7 +1235,7 @@ int main(void)
             const float moveIntervalSeconds = (float)SnakeGameGetMoveIntervalMs(&game) / 1000.0f;
 
             /* 累加这一帧经过的时间。 */
-            moveTimer += GetFrameTime();
+            moveTimer += frameTime;
 
             /* 当累计时间达到移动间隔时，才让核心层前进一步。 */
             if (moveTimer >= moveIntervalSeconds)
@@ -778,13 +1243,51 @@ int main(void)
                 /* 记录推进前的状态，用来判断这一帧是否刚好从运行进入死亡。 */
                 const SnakeGameStatus statusBeforeStep = SnakeGameGetStatus(&game);
 
+                /* 记录推进前的分数，用来判断这一帧是否刚好吃到食物。 */
+                const int scoreBeforeStep = SnakeGameGetScore(&game);
+
+                /* 记录推进前的等级，用来判断这一帧是否刚好升级。 */
+                const int levelBeforeStep = SnakeGameGetLevel(&game);
+
                 /* 推进游戏核心一步，内部会处理移动、吃食物、撞墙和自撞。 */
                 SnakeGameStep(&game);
+
+                /* 分数增加说明本帧吃到了食物，可以播放声音并绘制蛇头闪光。 */
+                if (SnakeGameGetScore(&game) > scoreBeforeStep)
+                {
+                    /* 吃到食物后的蛇头位置就是刚才食物所在的位置。 */
+                    SnakeGridPosition eatenPosition;
+
+                    /* 只有成功取到蛇头位置时才绘制格子闪光。 */
+                    if (SnakeGameGetSnakeHead(&game, &eatenPosition))
+                    {
+                        TriggerEatFeedback(&feedback, eatenPosition);
+                    }
+
+                    /* 播放吃食物音效，加载失败时函数会自动跳过。 */
+                    PlayEatSound(&sounds);
+                }
+
+                /* 等级增加说明本帧刚好达到升级条件。 */
+                if (SnakeGameGetLevel(&game) > levelBeforeStep)
+                {
+                    /* 触发棋盘上的升级提示文字。 */
+                    TriggerLevelFeedback(&feedback);
+
+                    /* 播放升级音效，加载失败时函数会自动跳过。 */
+                    PlayLevelSound(&sounds);
+                }
 
                 /* 如果这一帧刚刚死亡，就检查是否需要刷新本地最高分。 */
                 if (statusBeforeStep != SNAKE_GAME_STATUS_DEAD &&
                     SnakeGameGetStatus(&game) == SNAKE_GAME_STATUS_DEAD)
                 {
+                    /* 触发死亡红屏和棋盘抖动。 */
+                    TriggerDeathFeedback(&feedback);
+
+                    /* 播放死亡音效，加载失败时函数会自动跳过。 */
+                    PlayDeathSound(&sounds);
+
                     /* 比较本局分数和最高分，必要时写入 highscore.txt。 */
                     UpdateHighScoreAfterDeath(&game, &highScore);
                 }
@@ -810,6 +1313,21 @@ int main(void)
         /* 清空窗口背景，避免上一帧画面残留。 */
         ClearBackground(kWindowBackground);
 
+        /* 根据死亡反馈计算棋盘抖动偏移，右侧信息栏不参与抖动。 */
+        const Vector2 boardShakeOffset = GetBoardShakeOffset(&feedback);
+
+        /* 创建只带偏移的相机，用来临时移动棋盘绘制内容。 */
+        Camera2D boardCamera = { 0 };
+
+        /* 设置相机偏移，死亡反馈结束后这里会自然回到零。 */
+        boardCamera.offset = boardShakeOffset;
+
+        /* 保持缩放为 1，避免改变网格尺寸。 */
+        boardCamera.zoom = 1.0f;
+
+        /* 开始棋盘相机绘制，只有地图、食物和蛇会跟着死亡反馈抖动。 */
+        BeginMode2D(boardCamera);
+
         /* 绘制棋盘背景。 */
         DrawBoardBackground();
 
@@ -822,9 +1340,27 @@ int main(void)
         /* 如果蛇身渲染数据构建成功，就绘制整条蛇。 */
         if (BuildSnakeRenderData(&game, &snakeRenderData))
         {
+            /* 死亡时把蛇临时绘制成红色，强调最终碰撞状态。 */
+            if (SnakeGameGetStatus(&game) == SNAKE_GAME_STATUS_DEAD)
+            {
+                snakeRenderData.colorMode = SNAKE_COLOR_MODE_RED;
+            }
+
             /* 绘制蛇头和蛇身。 */
-            DrawSnake(&snakeRenderData);
+            DrawSnake(&snakeRenderData, &feedback);
         }
+
+        /* 在蛇头位置绘制吃食物闪光，让玩家立即看到得分反馈。 */
+        DrawEatFeedbackFlash(&feedback);
+
+        /* 结束棋盘相机绘制，后续覆盖层和信息栏保持稳定不抖动。 */
+        EndMode2D();
+
+        /* 绘制死亡红色覆盖，和棋盘抖动一起形成撞击反馈。 */
+        DrawDeathFeedback(&feedback);
+
+        /* 绘制升级提示文字，位置固定在棋盘区域内，不影响右侧信息栏。 */
+        DrawLevelFeedback(&feedback);
 
         /* 根据 READY、PAUSED、DEAD 状态绘制覆盖层，并传入最高分用于显示。 */
         DrawStateOverlay(&game, highScore);
@@ -834,6 +1370,15 @@ int main(void)
 
         /* 结束一帧绘制，把画面显示到窗口。 */
         EndDrawing();
+    }
+
+    /* 退出前释放界面音效资源。 */
+    UnloadUiSounds(&sounds);
+
+    /* 音频设备打开过才关闭，保持 raylib 音频生命周期成对。 */
+    if (IsAudioDeviceReady())
+    {
+        CloseAudioDevice();
     }
 
     /* 程序退出前销毁核心层链表，释放蛇身节点。 */
